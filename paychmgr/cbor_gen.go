@@ -147,18 +147,18 @@ func (t *VoucherInfo) UnmarshalCBOR(r io.Reader) error {
 
 	return nil
 }
-func (t *ChannelInfo) MarshalCBOR(w io.Writer) error {
+func (t *ChannelInfoStorable) MarshalCBOR(w io.Writer) error {
 	if t == nil {
 		_, err := w.Write(cbg.CborNull)
 		return err
 	}
-	if _, err := w.Write([]byte{166}); err != nil {
+	if _, err := w.Write([]byte{171}); err != nil {
 		return err
 	}
 
 	scratch := make([]byte, 9)
 
-	// t.Channel (address.Address) (struct)
+	// t.Channel (string) (string)
 	if len("Channel") > cbg.MaxLength {
 		return xerrors.Errorf("Value in field \"Channel\" was too long")
 	}
@@ -170,7 +170,14 @@ func (t *ChannelInfo) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if err := t.Channel.MarshalCBOR(w); err != nil {
+	if len(t.Channel) > cbg.MaxLength {
+		return xerrors.Errorf("Value in field t.Channel was too long")
+	}
+
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajTextString, uint64(len(t.Channel))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, t.Channel); err != nil {
 		return err
 	}
 
@@ -203,6 +210,22 @@ func (t *ChannelInfo) MarshalCBOR(w io.Writer) error {
 	}
 
 	if err := t.Target.MarshalCBOR(w); err != nil {
+		return err
+	}
+
+	// t.Sequence (uint64) (uint64)
+	if len("Sequence") > cbg.MaxLength {
+		return xerrors.Errorf("Value in field \"Sequence\" was too long")
+	}
+
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajTextString, uint64(len("Sequence"))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "Sequence"); err != nil {
+		return err
+	}
+
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajUnsignedInt, uint64(t.Sequence)); err != nil {
 		return err
 	}
 
@@ -263,11 +286,87 @@ func (t *ChannelInfo) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
+	// t.Amount (big.Int) (struct)
+	if len("Amount") > cbg.MaxLength {
+		return xerrors.Errorf("Value in field \"Amount\" was too long")
+	}
+
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajTextString, uint64(len("Amount"))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "Amount"); err != nil {
+		return err
+	}
+
+	if err := t.Amount.MarshalCBOR(w); err != nil {
+		return err
+	}
+
+	// t.PendingAmount (big.Int) (struct)
+	if len("PendingAmount") > cbg.MaxLength {
+		return xerrors.Errorf("Value in field \"PendingAmount\" was too long")
+	}
+
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajTextString, uint64(len("PendingAmount"))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "PendingAmount"); err != nil {
+		return err
+	}
+
+	if err := t.PendingAmount.MarshalCBOR(w); err != nil {
+		return err
+	}
+
+	// t.AddFundsMsg (cid.Cid) (struct)
+	if len("AddFundsMsg") > cbg.MaxLength {
+		return xerrors.Errorf("Value in field \"AddFundsMsg\" was too long")
+	}
+
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajTextString, uint64(len("AddFundsMsg"))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "AddFundsMsg"); err != nil {
+		return err
+	}
+
+	if t.AddFundsMsg == nil {
+		if _, err := w.Write(cbg.CborNull); err != nil {
+			return err
+		}
+	} else {
+		if err := cbg.WriteCidBuf(scratch, w, *t.AddFundsMsg); err != nil {
+			return xerrors.Errorf("failed to write cid field t.AddFundsMsg: %w", err)
+		}
+	}
+
+	// t.CreateMsg (cid.Cid) (struct)
+	if len("CreateMsg") > cbg.MaxLength {
+		return xerrors.Errorf("Value in field \"CreateMsg\" was too long")
+	}
+
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajTextString, uint64(len("CreateMsg"))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "CreateMsg"); err != nil {
+		return err
+	}
+
+	if t.CreateMsg == nil {
+		if _, err := w.Write(cbg.CborNull); err != nil {
+			return err
+		}
+	} else {
+		if err := cbg.WriteCidBuf(scratch, w, *t.CreateMsg); err != nil {
+			return xerrors.Errorf("failed to write cid field t.CreateMsg: %w", err)
+		}
+	}
+
 	return nil
 }
 
-func (t *ChannelInfo) UnmarshalCBOR(r io.Reader) error {
-	*t = ChannelInfo{}
+func (t *ChannelInfoStorable) UnmarshalCBOR(r io.Reader) error {
+	*t = ChannelInfoStorable{}
 
 	br := cbg.GetPeeker(r)
 	scratch := make([]byte, 8)
@@ -281,7 +380,7 @@ func (t *ChannelInfo) UnmarshalCBOR(r io.Reader) error {
 	}
 
 	if extra > cbg.MaxLength {
-		return fmt.Errorf("ChannelInfo: map struct too large (%d)", extra)
+		return fmt.Errorf("ChannelInfoStorable: map struct too large (%d)", extra)
 	}
 
 	var name string
@@ -299,15 +398,16 @@ func (t *ChannelInfo) UnmarshalCBOR(r io.Reader) error {
 		}
 
 		switch name {
-		// t.Channel (address.Address) (struct)
+		// t.Channel (string) (string)
 		case "Channel":
 
 			{
-
-				if err := t.Channel.UnmarshalCBOR(br); err != nil {
-					return xerrors.Errorf("unmarshaling t.Channel: %w", err)
+				sval, err := cbg.ReadStringBuf(br, scratch)
+				if err != nil {
+					return err
 				}
 
+				t.Channel = string(sval)
 			}
 			// t.Control (address.Address) (struct)
 		case "Control":
@@ -327,6 +427,21 @@ func (t *ChannelInfo) UnmarshalCBOR(r io.Reader) error {
 				if err := t.Target.UnmarshalCBOR(br); err != nil {
 					return xerrors.Errorf("unmarshaling t.Target: %w", err)
 				}
+
+			}
+			// t.Sequence (uint64) (uint64)
+		case "Sequence":
+
+			{
+
+				maj, extra, err = cbg.CborReadHeaderBuf(br, scratch)
+				if err != nil {
+					return err
+				}
+				if maj != cbg.MajUnsignedInt {
+					return fmt.Errorf("wrong type for uint64 field")
+				}
+				t.Sequence = uint64(extra)
 
 			}
 			// t.Direction (uint64) (uint64)
@@ -387,6 +502,76 @@ func (t *ChannelInfo) UnmarshalCBOR(r io.Reader) error {
 					return fmt.Errorf("wrong type for uint64 field")
 				}
 				t.NextLane = uint64(extra)
+
+			}
+			// t.Amount (big.Int) (struct)
+		case "Amount":
+
+			{
+
+				if err := t.Amount.UnmarshalCBOR(br); err != nil {
+					return xerrors.Errorf("unmarshaling t.Amount: %w", err)
+				}
+
+			}
+			// t.PendingAmount (big.Int) (struct)
+		case "PendingAmount":
+
+			{
+
+				if err := t.PendingAmount.UnmarshalCBOR(br); err != nil {
+					return xerrors.Errorf("unmarshaling t.PendingAmount: %w", err)
+				}
+
+			}
+			// t.AddFundsMsg (cid.Cid) (struct)
+		case "AddFundsMsg":
+
+			{
+
+				pb, err := br.PeekByte()
+				if err != nil {
+					return err
+				}
+				if pb == cbg.CborNull[0] {
+					var nbuf [1]byte
+					if _, err := br.Read(nbuf[:]); err != nil {
+						return err
+					}
+				} else {
+
+					c, err := cbg.ReadCid(br)
+					if err != nil {
+						return xerrors.Errorf("failed to read cid field t.AddFundsMsg: %w", err)
+					}
+
+					t.AddFundsMsg = &c
+				}
+
+			}
+			// t.CreateMsg (cid.Cid) (struct)
+		case "CreateMsg":
+
+			{
+
+				pb, err := br.PeekByte()
+				if err != nil {
+					return err
+				}
+				if pb == cbg.CborNull[0] {
+					var nbuf [1]byte
+					if _, err := br.Read(nbuf[:]); err != nil {
+						return err
+					}
+				} else {
+
+					c, err := cbg.ReadCid(br)
+					if err != nil {
+						return xerrors.Errorf("failed to read cid field t.CreateMsg: %w", err)
+					}
+
+					t.CreateMsg = &c
+				}
 
 			}
 

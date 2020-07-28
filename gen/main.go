@@ -34,7 +34,7 @@ func main() {
 
 	err = gen.WriteMapEncodersToFile("./paychmgr/cbor_gen.go", "paychmgr",
 		paychmgr.VoucherInfo{},
-		paychmgr.ChannelInfo{},
+		paychmgr.ChannelInfoStorable{},
 	)
 	if err != nil {
 		fmt.Println(err)
