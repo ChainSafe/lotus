@@ -28,6 +28,7 @@ import (
 	"github.com/filecoin-project/specs-actors/actors/runtime"
 	storage2 "github.com/filecoin-project/specs-storage/storage"
 
+	secondaryprovider "github.com/ChainSafe/fil-secondary-retrieval-markets/provider"
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain"
 	"github.com/filecoin-project/lotus/chain/beacon"
@@ -301,6 +302,7 @@ func Online() Option {
 			Override(new(dtypes.StagingDAG), modules.StagingDAG),
 			Override(new(dtypes.StagingGraphsync), modules.StagingGraphsync),
 			Override(new(retrievalmarket.RetrievalProvider), modules.RetrievalProvider),
+			Override(new(secondaryprovider.Provider), modules.SecondaryRetrievalProvider),
 			Override(new(dtypes.ProviderDealStore), modules.NewProviderDealStore),
 			Override(new(dtypes.ProviderDataTransfer), modules.NewProviderDAGServiceDataTransfer),
 			Override(new(dtypes.ProviderRequestValidator), modules.NewProviderRequestValidator),

@@ -56,6 +56,15 @@ import (
 	"github.com/filecoin-project/lotus/node/modules/helpers"
 	"github.com/filecoin-project/lotus/node/repo"
 	"github.com/filecoin-project/lotus/storage"
+
+	retrievalcache "github.com/ChainSafe/fil-secondary-retrieval-markets/cache"
+	retrievalnetwork "github.com/ChainSafe/fil-secondary-retrieval-markets/network"
+	secondaryprovider "github.com/ChainSafe/fil-secondary-retrieval-markets/provider"
+	retrievalshared "github.com/ChainSafe/fil-secondary-retrieval-markets/shared"
+	block "github.com/ipfs/go-block-format"
+	ds "github.com/ipfs/go-datastore"
+	logging "github.com/ipfs/go-log/v2"
+	libp2p "github.com/libp2p/go-libp2p"
 )
 
 var StorageCounterDSPrefix = "/storage/nextid"
@@ -400,7 +409,54 @@ func RetrievalProvider(h host.Host, miner *storage.Miner, sealer sectorstorage.S
 		return true, "", nil
 	})
 
+	// TODO: where to call this from?
+	SecondaryRetrievalProvider(h, ibs)
+
 	return retrievalimpl.NewProvider(maddr, adapter, netwk, pieceStore, ibs, namespace.Wrap(ds, datastore.NewKey("/retrievals/provider")), opt)
+}
+
+type SecondaryProviderStore struct {
+	bs dtypes.StagingBlockstore
+}
+
+func (s *SecondaryProviderStore) Has(params retrievalshared.Params) (bool, error) {
+	log.Info("secondary provider: received query", params.PayloadCID)
+	return s.bs.Has(params.PayloadCID)
+}
+
+func SecondaryRetrievalProvider(h host.Host, ibs dtypes.StagingBlockstore) (*secondaryprovider.Provider, error) {
+	_ = logging.SetLogLevel("provider", "DEBUG")
+
+	log.Info("creating secondary provider")
+
+	ctx := context.Background()
+	// we should be able to use the existing host, but I think there are some configuration differences
+	h2, err := libp2p.New(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	cache := retrievalcache.NewLFUCache(1024)
+	net, err := retrievalnetwork.NewNetwork(h2)
+	if err != nil {
+		return nil, err
+	}
+
+	b := block.NewBlock([]byte("noot"))
+	testCid := b.Cid()
+	_ = ibs.Put(b)
+	log.Info("put block into provider blockstore ", testCid)
+
+	// sanity check for keys
+	keyCh, _ := ibs.AllKeysChan(ctx)
+	for key := range keyCh {
+		log.Info("provider has key ", key)
+	}
+
+	p := secondaryprovider.NewProvider(net, &SecondaryProviderStore{ibs}, cache)
+	p.Start()
+	log.Info("started secondary provider: listening at ", net.MultiAddrs())
+	return p, nil
 }
 
 func SectorStorage(mctx helpers.MetricsCtx, lc fx.Lifecycle, ls stores.LocalStorage, si stores.SectorIndex, cfg *ffiwrapper.Config, sc sectorstorage.SealerConfig, urls sectorstorage.URLs, sa sectorstorage.StorageAuth) (*sectorstorage.Manager, error) {
