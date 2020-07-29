@@ -62,7 +62,7 @@ import (
 	secondaryprovider "github.com/ChainSafe/fil-secondary-retrieval-markets/provider"
 	retrievalshared "github.com/ChainSafe/fil-secondary-retrieval-markets/shared"
 	block "github.com/ipfs/go-block-format"
-	ds "github.com/ipfs/go-datastore"
+	libp2pnetwork "github.com/libp2p/go-libp2p-core/network"
 	logging "github.com/ipfs/go-log/v2"
 	libp2p "github.com/libp2p/go-libp2p"
 )
