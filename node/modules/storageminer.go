@@ -61,10 +61,9 @@ import (
 	retrievalnetwork "github.com/ChainSafe/fil-secondary-retrieval-markets/network"
 	secondaryprovider "github.com/ChainSafe/fil-secondary-retrieval-markets/provider"
 	retrievalshared "github.com/ChainSafe/fil-secondary-retrieval-markets/shared"
-	block "github.com/ipfs/go-block-format"
-	libp2pnetwork "github.com/libp2p/go-libp2p-core/network"
+	//block "github.com/ipfs/go-block-format"
 	logging "github.com/ipfs/go-log/v2"
-	libp2p "github.com/libp2p/go-libp2p"
+	//libp2p "github.com/libp2p/go-libp2p"
 )
 
 var StorageCounterDSPrefix = "/storage/nextid"
@@ -410,50 +409,31 @@ func RetrievalProvider(h host.Host, miner *storage.Miner, sealer sectorstorage.S
 	})
 
 	// TODO: where to call this from?
-	SecondaryRetrievalProvider(h, ibs)
+	SecondaryRetrievalProvider(h, full)
 
 	return retrievalimpl.NewProvider(maddr, adapter, netwk, pieceStore, ibs, namespace.Wrap(ds, datastore.NewKey("/retrievals/provider")), opt)
 }
 
 type SecondaryProviderStore struct {
-	bs dtypes.StagingBlockstore
+	full lapi.FullNode
 }
 
 func (s *SecondaryProviderStore) Has(params retrievalshared.Params) (bool, error) {
 	log.Info("secondary provider: received query", params.PayloadCID)
-	return s.bs.Has(params.PayloadCID)
+	return s.full.ClientHasLocal(context.Background(), params.PayloadCID)
 }
 
-func SecondaryRetrievalProvider(h host.Host, ibs dtypes.StagingBlockstore) (*secondaryprovider.Provider, error) {
+func SecondaryRetrievalProvider(h host.Host, full lapi.FullNode) (*secondaryprovider.Provider, error) {
 	_ = logging.SetLogLevel("provider", "DEBUG")
 
 	log.Info("creating secondary provider")
-
-	ctx := context.Background()
-	// we should be able to use the existing host, but I think there are some configuration differences
-	h2, err := libp2p.New(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	cache := retrievalcache.NewLFUCache(1024)
-	net, err := retrievalnetwork.NewNetwork(h2)
+	net, err := retrievalnetwork.NewNetwork(h)
 	if err != nil {
 		return nil, err
 	}
 
-	b := block.NewBlock([]byte("noot"))
-	testCid := b.Cid()
-	_ = ibs.Put(b)
-	log.Info("put block into provider blockstore ", testCid)
-
-	// sanity check for keys
-	keyCh, _ := ibs.AllKeysChan(ctx)
-	for key := range keyCh {
-		log.Info("provider has key ", key)
-	}
-
-	p := secondaryprovider.NewProvider(net, &SecondaryProviderStore{ibs}, cache)
+	p := secondaryprovider.NewProvider(net, &SecondaryProviderStore{full}, cache)
 	p.Start()
 	log.Info("started secondary provider: listening at ", net.MultiAddrs())
 	return p, nil
