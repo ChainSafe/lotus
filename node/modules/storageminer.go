@@ -61,9 +61,7 @@ import (
 	retrievalnetwork "github.com/ChainSafe/fil-secondary-retrieval-markets/network"
 	secondaryprovider "github.com/ChainSafe/fil-secondary-retrieval-markets/provider"
 	retrievalshared "github.com/ChainSafe/fil-secondary-retrieval-markets/shared"
-	//block "github.com/ipfs/go-block-format"
 	logging "github.com/ipfs/go-log/v2"
-	//libp2p "github.com/libp2p/go-libp2p"
 )
 
 var StorageCounterDSPrefix = "/storage/nextid"
