@@ -182,9 +182,17 @@ func StorageMiner(mctx helpers.MetricsCtx, lc fx.Lifecycle, api lapi.FullNode, h
 func HandleRetrieval(host host.Host, lc fx.Lifecycle, m retrievalmarket.RetrievalProvider, s *secondaryprovider.Provider) {
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
+			err := s.Start()
+			if err != nil {
+				return err
+			}
 			return m.Start()
 		},
 		OnStop: func(context.Context) error {
+			err := s.Stop()
+			if err != nil {
+				return err
+			}
 			return m.Stop()
 		},
 	})
@@ -406,9 +414,6 @@ func RetrievalProvider(h host.Host, miner *storage.Miner, sealer sectorstorage.S
 		return true, "", nil
 	})
 
-	// TODO: where to call this from?
-	//SecondaryRetrievalProvider(h, full)
-
 	return retrievalimpl.NewProvider(maddr, adapter, netwk, pieceStore, ibs, namespace.Wrap(ds, datastore.NewKey("/retrievals/provider")), opt)
 }
 
@@ -424,7 +429,6 @@ func (s *SecondaryProviderStore) Has(params retrievalshared.Params) (bool, error
 func SecondaryRetrievalProvider(h host.Host, full lapi.FullNode) (*secondaryprovider.Provider, error) {
 	_ = logging.SetLogLevel("provider", "DEBUG")
 
-	log.Info("creating secondary provider")
 	cache := retrievalcache.NewLFUCache(1024)
 	net, err := retrievalnetwork.NewNetwork(h)
 	if err != nil {
@@ -432,7 +436,6 @@ func SecondaryRetrievalProvider(h host.Host, full lapi.FullNode) (*secondaryprov
 	}
 
 	p := secondaryprovider.NewProvider(net, &SecondaryProviderStore{full}, cache)
-	p.Start()
 	log.Info("started secondary provider: listening at ", net.MultiAddrs())
 	return p, nil
 }
