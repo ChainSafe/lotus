@@ -56,6 +56,12 @@ import (
 	"github.com/filecoin-project/lotus/node/modules/helpers"
 	"github.com/filecoin-project/lotus/node/repo"
 	"github.com/filecoin-project/lotus/storage"
+
+	retrievalcache "github.com/ChainSafe/fil-secondary-retrieval-markets/cache"
+	retrievalnetwork "github.com/ChainSafe/fil-secondary-retrieval-markets/network"
+	secondaryprovider "github.com/ChainSafe/fil-secondary-retrieval-markets/provider"
+	retrievalshared "github.com/ChainSafe/fil-secondary-retrieval-markets/shared"
+	logging "github.com/ipfs/go-log/v2"
 )
 
 var StorageCounterDSPrefix = "/storage/nextid"
@@ -173,12 +179,20 @@ func StorageMiner(mctx helpers.MetricsCtx, lc fx.Lifecycle, api lapi.FullNode, h
 	return sm, nil
 }
 
-func HandleRetrieval(host host.Host, lc fx.Lifecycle, m retrievalmarket.RetrievalProvider) {
+func HandleRetrieval(host host.Host, lc fx.Lifecycle, m retrievalmarket.RetrievalProvider, s *secondaryprovider.Provider) {
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
+			err := s.Start()
+			if err != nil {
+				return err
+			}
 			return m.Start()
 		},
 		OnStop: func(context.Context) error {
+			err := s.Stop()
+			if err != nil {
+				return err
+			}
 			return m.Stop()
 		},
 	})
@@ -401,6 +415,29 @@ func RetrievalProvider(h host.Host, miner *storage.Miner, sealer sectorstorage.S
 	})
 
 	return retrievalimpl.NewProvider(maddr, adapter, netwk, pieceStore, ibs, namespace.Wrap(ds, datastore.NewKey("/retrievals/provider")), opt)
+}
+
+type SecondaryProviderStore struct {
+	full lapi.FullNode
+}
+
+func (s *SecondaryProviderStore) Has(params retrievalshared.Params) (bool, error) {
+	log.Info("secondary provider: received query", params.PayloadCID)
+	return s.full.ClientHasLocal(context.Background(), params.PayloadCID)
+}
+
+func SecondaryRetrievalProvider(h host.Host, full lapi.FullNode) (*secondaryprovider.Provider, error) {
+	_ = logging.SetLogLevel("provider", "DEBUG")
+
+	cache := retrievalcache.NewLFUCache(1024)
+	net, err := retrievalnetwork.NewNetwork(h)
+	if err != nil {
+		return nil, err
+	}
+
+	p := secondaryprovider.NewProvider(net, &SecondaryProviderStore{full}, cache)
+	log.Info("started secondary provider: listening at ", net.MultiAddrs())
+	return p, nil
 }
 
 func SectorStorage(mctx helpers.MetricsCtx, lc fx.Lifecycle, ls stores.LocalStorage, si stores.SectorIndex, cfg *ffiwrapper.Config, sc sectorstorage.SealerConfig, urls sectorstorage.URLs, sa sectorstorage.StorageAuth) (*sectorstorage.Manager, error) {
