@@ -179,7 +179,7 @@ func StorageMiner(mctx helpers.MetricsCtx, lc fx.Lifecycle, api lapi.FullNode, h
 	return sm, nil
 }
 
-func HandleRetrieval(host host.Host, lc fx.Lifecycle, m retrievalmarket.RetrievalProvider) {
+func HandleRetrieval(host host.Host, lc fx.Lifecycle, m retrievalmarket.RetrievalProvider, s *secondaryprovider.Provider) {
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
 			return m.Start()
@@ -407,7 +407,7 @@ func RetrievalProvider(h host.Host, miner *storage.Miner, sealer sectorstorage.S
 	})
 
 	// TODO: where to call this from?
-	SecondaryRetrievalProvider(h, full)
+	//SecondaryRetrievalProvider(h, full)
 
 	return retrievalimpl.NewProvider(maddr, adapter, netwk, pieceStore, ibs, namespace.Wrap(ds, datastore.NewKey("/retrievals/provider")), opt)
 }

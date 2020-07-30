@@ -302,7 +302,7 @@ func Online() Option {
 			Override(new(dtypes.StagingDAG), modules.StagingDAG),
 			Override(new(dtypes.StagingGraphsync), modules.StagingGraphsync),
 			Override(new(retrievalmarket.RetrievalProvider), modules.RetrievalProvider),
-			Override(new(secondaryprovider.Provider), modules.SecondaryRetrievalProvider),
+			Override(new(*secondaryprovider.Provider), modules.SecondaryRetrievalProvider),
 			Override(new(dtypes.ProviderDealStore), modules.NewProviderDealStore),
 			Override(new(dtypes.ProviderDataTransfer), modules.NewProviderDAGServiceDataTransfer),
 			Override(new(dtypes.ProviderRequestValidator), modules.NewProviderRequestValidator),
