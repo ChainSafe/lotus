@@ -235,14 +235,17 @@ func StorageMiner(fc config.MinerFeeConfig) func(params StorageMinerParams) (*st
 // 			return m.Start()
 // =======
 func HandleRetrieval(host host.Host, lc fx.Lifecycle, m retrievalmarket.RetrievalProvider, s *secondaryprovider.Provider, j journal.Journal) {
+	log.Info("HandleRetrieval")
 	m.OnReady(marketevents.ReadyLogger("retrieval provider"))
 	lc.Append(fx.Hook{
 
 		OnStart: func(ctx context.Context) error {
+			log.Info("starting retrieval providers...")
 			err := s.Start()
 			if err != nil {
 				return err
 			}
+			log.Info("started secondary provider")
 
 			m.SubscribeToEvents(marketevents.RetrievalProviderLogger)
 
