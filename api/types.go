@@ -2,11 +2,15 @@ package api
 
 import (
 	"encoding/json"
-	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"github.com/filecoin-project/specs-actors/actors/builtin/miner"
+	"fmt"
+
+	datatransfer "github.com/filecoin-project/go-data-transfer"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/lotus/build"
+	"github.com/ipfs/go-cid"
 
 	"github.com/libp2p/go-libp2p-core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -40,38 +44,66 @@ type ObjStat struct {
 
 type PubsubScore struct {
 	ID    peer.ID
-	Score float64
+	Score *pubsub.PeerScoreSnapshot
 }
 
-type MinerInfo struct {
-	Owner                      address.Address // Must be an ID-address.
-	Worker                     address.Address // Must be an ID-address.
-	NewWorker                  address.Address // Must be an ID-address.
-	WorkerChangeEpoch          abi.ChainEpoch
-	PeerId                     peer.ID
-	Multiaddrs                 []abi.Multiaddrs
-	SealProofType              abi.RegisteredSealProof
-	SectorSize                 abi.SectorSize
-	WindowPoStPartitionSectors uint64
+type MessageSendSpec struct {
+	MaxFee abi.TokenAmount
 }
 
-func NewApiMinerInfo(info miner.MinerInfo) MinerInfo {
-	mi := MinerInfo{
-		Owner:                      info.Owner,
-		Worker:                     info.Worker,
-		NewWorker:                  address.Undef,
-		WorkerChangeEpoch:          -1,
-		PeerId:                     peer.ID(info.PeerId),
-		Multiaddrs:                 info.Multiaddrs,
-		SealProofType:              info.SealProofType,
-		SectorSize:                 info.SectorSize,
-		WindowPoStPartitionSectors: info.WindowPoStPartitionSectors,
+var DefaultMessageSendSpec = MessageSendSpec{
+	// MaxFee of 0.1FIL
+	MaxFee: abi.NewTokenAmount(int64(build.FilecoinPrecision) / 10),
+}
+
+func (ms *MessageSendSpec) Get() MessageSendSpec {
+	if ms == nil {
+		return DefaultMessageSendSpec
 	}
 
-	if info.PendingWorkerKey != nil {
-		mi.NewWorker = info.PendingWorkerKey.NewWorker
-		mi.WorkerChangeEpoch = info.PendingWorkerKey.EffectiveAt
-	}
+	return *ms
+}
 
-	return mi
+type DataTransferChannel struct {
+	TransferID  datatransfer.TransferID
+	Status      datatransfer.Status
+	BaseCID     cid.Cid
+	IsInitiator bool
+	IsSender    bool
+	Voucher     string
+	Message     string
+	OtherPeer   peer.ID
+	Transferred uint64
+}
+
+// NewDataTransferChannel constructs an API DataTransferChannel type from full channel state snapshot and a host id
+func NewDataTransferChannel(hostID peer.ID, channelState datatransfer.ChannelState) DataTransferChannel {
+	channel := DataTransferChannel{
+		TransferID: channelState.TransferID(),
+		Status:     channelState.Status(),
+		BaseCID:    channelState.BaseCID(),
+		IsSender:   channelState.Sender() == hostID,
+		Message:    channelState.Message(),
+	}
+	stringer, ok := channelState.Voucher().(fmt.Stringer)
+	if ok {
+		channel.Voucher = stringer.String()
+	} else {
+		voucherJSON, err := json.Marshal(channelState.Voucher())
+		if err != nil {
+			channel.Voucher = fmt.Errorf("Voucher Serialization: %w", err).Error()
+		} else {
+			channel.Voucher = string(voucherJSON)
+		}
+	}
+	if channel.IsSender {
+		channel.IsInitiator = !channelState.IsPull()
+		channel.Transferred = channelState.Sent()
+		channel.OtherPeer = channelState.Recipient()
+	} else {
+		channel.IsInitiator = channelState.IsPull()
+		channel.Transferred = channelState.Received()
+		channel.OtherPeer = channelState.Sender()
+	}
+	return channel
 }

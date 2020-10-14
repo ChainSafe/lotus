@@ -16,21 +16,28 @@ import (
 	"sort"
 	"time"
 
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
+	"github.com/filecoin-project/lotus/lib/blockstore"
 	_ "github.com/filecoin-project/lotus/lib/sigs/bls"
 	_ "github.com/filecoin-project/lotus/lib/sigs/secp"
-	"github.com/filecoin-project/sector-storage/ffiwrapper"
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"golang.org/x/xerrors"
+	"github.com/ipld/go-car"
 
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
+
+	bdg "github.com/dgraph-io/badger/v2"
 	"github.com/ipfs/go-datastore"
 	badger "github.com/ipfs/go-ds-badger2"
-	blockstore "github.com/ipfs/go-ipfs-blockstore"
+	pebbleds "github.com/ipfs/go-ds-pebble"
+
 	"github.com/urfave/cli/v2"
+	"golang.org/x/xerrors"
 )
 
 type TipSetExec struct {
@@ -55,6 +62,33 @@ var importBenchCmd = &cli.Command{
 			Usage: "set the parallelism factor for batch seal verification",
 			Value: runtime.NumCPU(),
 		},
+		&cli.StringFlag{
+			Name:  "repodir",
+			Usage: "set the repo directory for the lotus bench run (defaults to /tmp)",
+		},
+		&cli.StringFlag{
+			Name:  "syscall-cache",
+			Usage: "read and write syscall results from datastore",
+		},
+		&cli.BoolFlag{
+			Name:  "export-traces",
+			Usage: "should we export execution traces",
+			Value: true,
+		},
+		&cli.BoolFlag{
+			Name:  "no-import",
+			Usage: "should we import the chain? if set to true chain has to be previously imported",
+		},
+		&cli.BoolFlag{
+			Name:  "global-profile",
+			Value: true,
+		},
+		&cli.Int64Flag{
+			Name: "start-at",
+		},
+		&cli.BoolFlag{
+			Name: "only-import",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 		vm.BatchSealVerifyParallelism = cctx.Int("batch-seal-verify-threads")
@@ -69,38 +103,144 @@ var importBenchCmd = &cli.Command{
 		}
 		defer cfi.Close() //nolint:errcheck // read only file
 
-		tdir, err := ioutil.TempDir("", "lotus-import-bench")
-		if err != nil {
-			return err
+		go func() {
+			http.ListenAndServe("localhost:6060", nil) //nolint:errcheck
+		}()
+
+		var tdir string
+		if rdir := cctx.String("repodir"); rdir != "" {
+			tdir = rdir
+		} else {
+			tmp, err := ioutil.TempDir("", "lotus-import-bench")
+			if err != nil {
+				return err
+			}
+			tdir = tmp
 		}
 
-		bds, err := badger.NewDatastore(tdir, nil)
+		bdgOpt := badger.DefaultOptions
+		bdgOpt.GcInterval = 0
+		bdgOpt.Options = bdg.DefaultOptions("")
+		bdgOpt.Options.SyncWrites = false
+		bdgOpt.Options.Truncate = true
+		bdgOpt.Options.DetectConflicts = false
+
+		var bds datastore.Batching
+		if false {
+			cache := 512
+			bds, err = pebbleds.NewDatastore(tdir, &pebble.Options{
+				// Pebble has a single combined cache area and the write
+				// buffers are taken from this too. Assign all available
+				// memory allowance for cache.
+				Cache: pebble.NewCache(int64(cache * 1024 * 1024)),
+				// The size of memory table(as well as the write buffer).
+				// Note, there may have more than two memory tables in the system.
+				// MemTableStopWritesThreshold can be configured to avoid the memory abuse.
+				MemTableSize: cache * 1024 * 1024 / 4,
+				// The default compaction concurrency(1 thread),
+				// Here use all available CPUs for faster compaction.
+				MaxConcurrentCompactions: runtime.NumCPU(),
+				// Per-level options. Options for at least one level must be specified. The
+				// options for the last level are used for all subsequent levels.
+				Levels: []pebble.LevelOptions{
+					{TargetFileSize: 16 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10), Compression: pebble.NoCompression},
+				},
+				Logger: log,
+			})
+		} else {
+			bds, err = badger.NewDatastore(tdir, &bdgOpt)
+		}
 		if err != nil {
 			return err
 		}
+		defer bds.Close() //nolint:errcheck
+
 		bs := blockstore.NewBlockstore(bds)
-		cbs, err := blockstore.CachedBlockstore(context.TODO(), bs, blockstore.DefaultCacheOpts())
+		cacheOpts := blockstore.DefaultCacheOpts()
+		cacheOpts.HasBloomFilterSize = 0
+
+		cbs, err := blockstore.CachedBlockstore(context.TODO(), bs, cacheOpts)
 		if err != nil {
 			return err
 		}
 		bs = cbs
 		ds := datastore.NewMapDatastore()
-		cs := store.NewChainStore(bs, ds, vm.Syscalls(ffiwrapper.ProofVerifier))
+
+		var verifier ffiwrapper.Verifier = ffiwrapper.ProofVerifier
+		if cctx.IsSet("syscall-cache") {
+			scds, err := badger.NewDatastore(cctx.String("syscall-cache"), &bdgOpt)
+			if err != nil {
+				return xerrors.Errorf("opening syscall-cache datastore: %w", err)
+			}
+			defer scds.Close() //nolint:errcheck
+
+			verifier = &cachingVerifier{
+				ds:      scds,
+				backend: verifier,
+			}
+		}
+		if cctx.Bool("only-gc") {
+			return nil
+		}
+
+		cs := store.NewChainStore(bs, ds, vm.Syscalls(verifier), nil)
 		stm := stmgr.NewStateManager(cs)
 
-		prof, err := os.Create("import-bench.prof")
+		if cctx.Bool("global-profile") {
+			prof, err := os.Create("import-bench.prof")
+			if err != nil {
+				return err
+			}
+			defer prof.Close() //nolint:errcheck
+
+			if err := pprof.StartCPUProfile(prof); err != nil {
+				return err
+			}
+		}
+
+		var head *types.TipSet
+		if !cctx.Bool("no-import") {
+			head, err = cs.Import(cfi)
+			if err != nil {
+				return err
+			}
+		} else {
+			cr, err := car.NewCarReader(cfi)
+			if err != nil {
+				return err
+			}
+			head, err = cs.LoadTipSet(types.NewTipSetKey(cr.Header.Roots...))
+			if err != nil {
+				return err
+			}
+		}
+
+		if cctx.Bool("only-import") {
+			return nil
+		}
+
+		gb, err := cs.GetTipsetByHeight(context.TODO(), 0, head, true)
 		if err != nil {
 			return err
 		}
-		defer prof.Close() //nolint:errcheck
 
-		if err := pprof.StartCPUProfile(prof); err != nil {
+		err = cs.SetGenesis(gb.Blocks()[0])
+		if err != nil {
 			return err
 		}
 
-		head, err := cs.Import(cfi)
-		if err != nil {
-			return err
+		startEpoch := abi.ChainEpoch(1)
+		if cctx.IsSet("start-at") {
+			startEpoch = abi.ChainEpoch(cctx.Int64("start-at"))
+			start, err := cs.GetTipsetByHeight(context.TODO(), abi.ChainEpoch(cctx.Int64("start-at")), head, true)
+			if err != nil {
+				return err
+			}
+
+			err = cs.SetHead(start)
+			if err != nil {
+				return err
+			}
 		}
 
 		if h := cctx.Int64("height"); h != 0 {
@@ -113,7 +253,7 @@ var importBenchCmd = &cli.Command{
 
 		ts := head
 		tschain := []*types.TipSet{ts}
-		for ts.Height() != 0 {
+		for ts.Height() > startEpoch {
 			next, err := cs.LoadTipSet(ts.Parents())
 			if err != nil {
 				return err
@@ -123,45 +263,48 @@ var importBenchCmd = &cli.Command{
 			ts = next
 		}
 
-		ibj, err := os.Create("import-bench.json")
-		if err != nil {
-			return err
+		var enc *json.Encoder
+		if cctx.Bool("export-traces") {
+			ibj, err := os.Create("import-bench.json")
+			if err != nil {
+				return err
+			}
+			defer ibj.Close() //nolint:errcheck
+
+			enc = json.NewEncoder(ibj)
 		}
-		defer ibj.Close() //nolint:errcheck
 
-		enc := json.NewEncoder(ibj)
-
-		var lastTse *TipSetExec
-
-		lastState := tschain[len(tschain)-1].ParentState()
-		for i := len(tschain) - 2; i >= 0; i-- {
+		for i := len(tschain) - 1; i >= 1; i-- {
 			cur := tschain[i]
+			start := time.Now()
 			log.Infof("computing state (height: %d, ts=%s)", cur.Height(), cur.Cids())
-			if cur.ParentState() != lastState {
-				lastTrace := lastTse.Trace
+			st, trace, err := stm.ExecutionTrace(context.TODO(), cur)
+			if err != nil {
+				return err
+			}
+			tse := &TipSetExec{
+				TipSet:   cur.Key(),
+				Trace:    trace,
+				Duration: time.Since(start),
+			}
+			if enc != nil {
+				stripCallers(tse.Trace)
+
+				if err := enc.Encode(tse); err != nil {
+					return xerrors.Errorf("failed to write out tipsetexec: %w", err)
+				}
+			}
+			if tschain[i-1].ParentState() != st {
+				stripCallers(tse.Trace)
+				lastTrace := tse.Trace
 				d, err := json.MarshalIndent(lastTrace, "", "  ")
 				if err != nil {
 					panic(err)
 				}
 				fmt.Println("TRACE")
 				fmt.Println(string(d))
-				return xerrors.Errorf("tipset chain had state mismatch at height %d (%s != %s)", cur.Height(), cur.ParentState(), lastState)
-			}
-			start := time.Now()
-			st, trace, err := stm.ExecutionTrace(context.TODO(), cur)
-			if err != nil {
-				return err
-			}
-			stripCallers(trace)
-
-			lastTse = &TipSetExec{
-				TipSet:   cur.Key(),
-				Trace:    trace,
-				Duration: time.Since(start),
-			}
-			lastState = st
-			if err := enc.Encode(lastTse); err != nil {
-				return xerrors.Errorf("failed to write out tipsetexec: %w", err)
+				//fmt.Println(statediff.Diff(context.Background(), bs, tschain[i-1].ParentState(), st, statediff.ExpandActors))
+				return xerrors.Errorf("tipset chain had state mismatch at height %d (%s != %s)", cur.Height(), cur.ParentState(), st)
 			}
 		}
 
@@ -203,30 +346,12 @@ func countGasCosts(et *types.ExecutionTrace) (int64, int64) {
 	}
 
 	for _, sub := range et.Subcalls {
-		c, v := countGasCosts(&sub)
+		c, v := countGasCosts(&sub) //nolint
 		cgas += c
 		vgas += v
 	}
 
 	return cgas, vgas
-}
-
-func compStats(vals []float64) (float64, float64) {
-	var sum float64
-
-	for _, v := range vals {
-		sum += v
-	}
-
-	av := sum / float64(len(vals))
-
-	var varsum float64
-	for _, v := range vals {
-		delta := av - v
-		varsum += delta * delta
-	}
-
-	return av, math.Sqrt(varsum / float64(len(vals)))
 }
 
 type stats struct {
@@ -253,20 +378,20 @@ func (cov1 *covar) VarianceX() float64 {
 	return cov1.m2x / (cov1.n - 1)
 }
 
-func (v1 *covar) StddevX() float64 {
-	return math.Sqrt(v1.VarianceX())
+func (cov1 *covar) StddevX() float64 {
+	return math.Sqrt(cov1.VarianceX())
 }
 
 func (cov1 *covar) VarianceY() float64 {
 	return cov1.m2y / (cov1.n - 1)
 }
 
-func (v1 *covar) StddevY() float64 {
-	return math.Sqrt(v1.VarianceY())
+func (cov1 *covar) StddevY() float64 {
+	return math.Sqrt(cov1.VarianceY())
 }
 
 func (cov1 *covar) AddPoint(x, y float64) {
-	cov1.n += 1
+	cov1.n++
 
 	dx := x - cov1.meanX
 	cov1.meanX += dx / cov1.n
@@ -333,7 +458,7 @@ type meanVar struct {
 
 func (v1 *meanVar) AddPoint(value float64) {
 	// based on https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
-	v1.n += 1
+	v1.n++
 	delta := value - v1.mean
 	v1.mean += delta / v1.n
 	delta2 := value - v1.mean
@@ -405,22 +530,36 @@ func getExtras(ex interface{}) (*string, *float64) {
 func tallyGasCharges(charges map[string]*stats, et types.ExecutionTrace) {
 	for i, gc := range et.GasCharges {
 		name := gc.Name
-		if name == "OnIpldGetStart" {
+		if name == "OnIpldGetEnd" {
 			continue
 		}
 		tt := float64(gc.TimeTaken.Nanoseconds())
-		if name == "OnIpldGet" {
-			prev := et.GasCharges[i-1]
-			if prev.Name != "OnIpldGetStart" {
-				log.Warn("OnIpldGet without OnIpldGetStart")
-			}
-			tt += float64(prev.TimeTaken.Nanoseconds())
+		if name == "OnVerifyPost" && tt > 2e9 {
+			log.Warnf("Skipping abnormally long OnVerifyPost: %fs", tt/1e9)
+			// discard initial very long OnVerifyPost
+			continue
 		}
 		eType, eSize := getExtras(gc.Extra)
+
+		if name == "OnIpldGet" {
+			next := &types.GasTrace{}
+			if i+1 < len(et.GasCharges) {
+				next = et.GasCharges[i+1]
+			}
+			if next.Name != "OnIpldGetEnd" {
+				log.Warn("OnIpldGet without OnIpldGetEnd")
+			} else {
+				_, size := getExtras(next.Extra)
+				eSize = size
+			}
+		}
 		if eType != nil {
 			name += "-" + *eType
 		}
-		compGas := gc.VirtualComputeGas
+		compGas := gc.ComputeGas
+		if compGas == 0 {
+			compGas = gc.VirtualComputeGas
+		}
 		if compGas == 0 {
 			compGas = 1
 		}
@@ -456,13 +595,14 @@ var importAnalyzeCmd = &cli.Command{
 		}
 
 		go func() {
-			http.ListenAndServe("localhost:6060", nil)
+			http.ListenAndServe("localhost:6060", nil) //nolint:errcheck
 		}()
 
 		fi, err := os.Open(cctx.Args().First())
 		if err != nil {
 			return err
 		}
+		defer fi.Close() //nolint:errcheck
 
 		const nWorkers = 16
 		jsonIn := make(chan []byte, 2*nWorkers)
@@ -604,7 +744,7 @@ var importAnalyzeCmd = &cli.Command{
 			timeInActors := actorExec.timeTaken.Mean() * actorExec.timeTaken.n
 			fmt.Printf("Avarage time per epoch in actors: %s (%.1f%%)\n", time.Duration(timeInActors)/time.Duration(totalTipsets), timeInActors/float64(totalTime)*100)
 		}
-		if actorExecDone, ok := charges["OnActorExecDone"]; ok {
+		if actorExecDone, ok := charges["OnMethodInvocationDone"]; ok {
 			timeInActors := actorExecDone.timeTaken.Mean() * actorExecDone.timeTaken.n
 			fmt.Printf("Avarage time per epoch in OnActorExecDone %s (%.1f%%)\n", time.Duration(timeInActors)/time.Duration(totalTipsets), timeInActors/float64(totalTime)*100)
 		}

@@ -2,19 +2,20 @@ package full
 
 import (
 	"context"
-	"github.com/filecoin-project/specs-actors/actors/abi/big"
+
+	"github.com/filecoin-project/go-state-types/big"
 
 	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/multisig"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"github.com/filecoin-project/specs-actors/actors/builtin"
-	init_ "github.com/filecoin-project/specs-actors/actors/builtin/init"
-	samsig "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
+
+	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
+	multisig0 "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
 
 	"github.com/ipfs/go-cid"
-	"github.com/minio/blake2b-simd"
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
 )
@@ -22,67 +23,35 @@ import (
 type MsigAPI struct {
 	fx.In
 
-	WalletAPI WalletAPI
-	StateAPI  StateAPI
-	MpoolAPI  MpoolAPI
+	StateAPI StateAPI
+	MpoolAPI MpoolAPI
 }
 
-func (a *MsigAPI) MsigCreate(ctx context.Context, req int64, addrs []address.Address, duration abi.ChainEpoch, val types.BigInt, src address.Address, gp types.BigInt) (cid.Cid, error) {
-
-	lenAddrs := int64(len(addrs))
-
-	if lenAddrs < req {
-		return cid.Undef, xerrors.Errorf("cannot require signing of more addresses than provided for multisig")
+func (a *MsigAPI) messageBuilder(ctx context.Context, from address.Address) (multisig.MessageBuilder, error) {
+	nver, err := a.StateAPI.StateNetworkVersion(ctx, types.EmptyTSK)
+	if err != nil {
+		return nil, err
 	}
 
-	if req == 0 {
-		req = lenAddrs
+	return multisig.Message(actors.VersionForNetwork(nver), from), nil
+}
+
+// TODO: remove gp (gasPrice) from arguments
+// TODO: Add "vesting start" to arguments.
+func (a *MsigAPI) MsigCreate(ctx context.Context, req uint64, addrs []address.Address, duration abi.ChainEpoch, val types.BigInt, src address.Address, gp types.BigInt) (cid.Cid, error) {
+
+	mb, err := a.messageBuilder(ctx, src)
+	if err != nil {
+		return cid.Undef, err
 	}
 
-	if src == address.Undef {
-		return cid.Undef, xerrors.Errorf("must provide source address")
-	}
-
-	if gp == types.EmptyInt {
-		gp = types.NewInt(1)
-	}
-
-	// Set up constructor parameters for multisig
-	msigParams := &samsig.ConstructorParams{
-		Signers:               addrs,
-		NumApprovalsThreshold: req,
-		UnlockDuration:        duration,
-	}
-
-	enc, actErr := actors.SerializeParams(msigParams)
-	if actErr != nil {
-		return cid.Undef, actErr
-	}
-
-	// new actors are created by invoking 'exec' on the init actor with the constructor params
-	execParams := &init_.ExecParams{
-		CodeCID:           builtin.MultisigActorCodeID,
-		ConstructorParams: enc,
-	}
-
-	enc, actErr = actors.SerializeParams(execParams)
-	if actErr != nil {
-		return cid.Undef, actErr
-	}
-
-	// now we create the message to send this with
-	msg := types.Message{
-		To:       builtin.InitActorAddr,
-		From:     src,
-		Method:   builtin.MethodsInit.Exec,
-		Params:   enc,
-		GasPrice: gp,
-		GasLimit: 1000000,
-		Value:    val,
+	msg, err := mb.Create(addrs, req, 0, duration, val)
+	if err != nil {
+		return cid.Undef, err
 	}
 
 	// send the message out to the network
-	smsg, err := a.MpoolAPI.MpoolPushMessage(ctx, &msg)
+	smsg, err := a.MpoolAPI.MpoolPushMessage(ctx, msg, nil)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -92,48 +61,49 @@ func (a *MsigAPI) MsigCreate(ctx context.Context, req int64, addrs []address.Add
 
 func (a *MsigAPI) MsigPropose(ctx context.Context, msig address.Address, to address.Address, amt types.BigInt, src address.Address, method uint64, params []byte) (cid.Cid, error) {
 
-	if msig == address.Undef {
-		return cid.Undef, xerrors.Errorf("must provide a multisig address for proposal")
+	mb, err := a.messageBuilder(ctx, src)
+	if err != nil {
+		return cid.Undef, err
 	}
 
-	if to == address.Undef {
-		return cid.Undef, xerrors.Errorf("must provide a target address for proposal")
+	msg, err := mb.Propose(msig, to, amt, abi.MethodNum(method), params)
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("failed to create proposal: %w", err)
 	}
 
-	if amt.Sign() == -1 {
-		return cid.Undef, xerrors.Errorf("must provide a positive amount for proposed send")
+	smsg, err := a.MpoolAPI.MpoolPushMessage(ctx, msg, nil)
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("failed to push message: %w", err)
 	}
 
-	if src == address.Undef {
-		return cid.Undef, xerrors.Errorf("must provide source address")
-	}
+	return smsg.Cid(), nil
+}
 
-	enc, actErr := actors.SerializeParams(&samsig.ProposeParams{
-		To:     to,
-		Value:  amt,
-		Method: abi.MethodNum(method),
-		Params: params,
-	})
+func (a *MsigAPI) MsigAddPropose(ctx context.Context, msig address.Address, src address.Address, newAdd address.Address, inc bool) (cid.Cid, error) {
+	enc, actErr := serializeAddParams(newAdd, inc)
 	if actErr != nil {
 		return cid.Undef, actErr
 	}
 
-	msg := &types.Message{
-		To:       msig,
-		From:     src,
-		Value:    types.NewInt(0),
-		Method:   builtin.MethodsMultisig.Propose,
-		Params:   enc,
-		GasLimit: 100000,
-		GasPrice: types.NewInt(1),
+	return a.MsigPropose(ctx, msig, msig, big.Zero(), src, uint64(builtin0.MethodsMultisig.AddSigner), enc)
+}
+
+func (a *MsigAPI) MsigAddApprove(ctx context.Context, msig address.Address, src address.Address, txID uint64, proposer address.Address, newAdd address.Address, inc bool) (cid.Cid, error) {
+	enc, actErr := serializeAddParams(newAdd, inc)
+	if actErr != nil {
+		return cid.Undef, actErr
 	}
 
-	smsg, err := a.MpoolAPI.MpoolPushMessage(ctx, msg)
-	if err != nil {
-		return cid.Undef, nil
+	return a.MsigApproveTxnHash(ctx, msig, txID, proposer, msig, big.Zero(), src, uint64(builtin0.MethodsMultisig.AddSigner), enc)
+}
+
+func (a *MsigAPI) MsigAddCancel(ctx context.Context, msig address.Address, src address.Address, txID uint64, newAdd address.Address, inc bool) (cid.Cid, error) {
+	enc, actErr := serializeAddParams(newAdd, inc)
+	if actErr != nil {
+		return cid.Undef, actErr
 	}
 
-	return smsg.Cid(), nil
+	return a.MsigCancel(ctx, msig, txID, msig, big.Zero(), src, uint64(builtin0.MethodsMultisig.AddSigner), enc)
 }
 
 func (a *MsigAPI) MsigSwapPropose(ctx context.Context, msig address.Address, src address.Address, oldAdd address.Address, newAdd address.Address) (cid.Cid, error) {
@@ -142,7 +112,7 @@ func (a *MsigAPI) MsigSwapPropose(ctx context.Context, msig address.Address, src
 		return cid.Undef, actErr
 	}
 
-	return a.MsigPropose(ctx, msig, msig, big.Zero(), src, uint64(builtin.MethodsMultisig.SwapSigner), enc)
+	return a.MsigPropose(ctx, msig, msig, big.Zero(), src, uint64(builtin0.MethodsMultisig.SwapSigner), enc)
 }
 
 func (a *MsigAPI) MsigSwapApprove(ctx context.Context, msig address.Address, src address.Address, txID uint64, proposer address.Address, oldAdd address.Address, newAdd address.Address) (cid.Cid, error) {
@@ -151,7 +121,7 @@ func (a *MsigAPI) MsigSwapApprove(ctx context.Context, msig address.Address, src
 		return cid.Undef, actErr
 	}
 
-	return a.MsigApprove(ctx, msig, txID, proposer, msig, big.Zero(), src, uint64(builtin.MethodsMultisig.SwapSigner), enc)
+	return a.MsigApproveTxnHash(ctx, msig, txID, proposer, msig, big.Zero(), src, uint64(builtin0.MethodsMultisig.SwapSigner), enc)
 }
 
 func (a *MsigAPI) MsigSwapCancel(ctx context.Context, msig address.Address, src address.Address, txID uint64, oldAdd address.Address, newAdd address.Address) (cid.Cid, error) {
@@ -160,28 +130,69 @@ func (a *MsigAPI) MsigSwapCancel(ctx context.Context, msig address.Address, src 
 		return cid.Undef, actErr
 	}
 
-	return a.MsigCancel(ctx, msig, txID, msig, big.Zero(), src, uint64(builtin.MethodsMultisig.SwapSigner), enc)
+	return a.MsigCancel(ctx, msig, txID, msig, big.Zero(), src, uint64(builtin0.MethodsMultisig.SwapSigner), enc)
 }
 
-func (a *MsigAPI) MsigApprove(ctx context.Context, msig address.Address, txID uint64, proposer address.Address, to address.Address, amt types.BigInt, src address.Address, method uint64, params []byte) (cid.Cid, error) {
-	return a.msigApproveOrCancel(ctx, api.MsigApprove, msig, txID, proposer, to, amt, src, method, params)
+func (a *MsigAPI) MsigApprove(ctx context.Context, msig address.Address, txID uint64, src address.Address) (cid.Cid, error) {
+	return a.msigApproveOrCancelSimple(ctx, api.MsigApprove, msig, txID, src)
+}
+
+func (a *MsigAPI) MsigApproveTxnHash(ctx context.Context, msig address.Address, txID uint64, proposer address.Address, to address.Address, amt types.BigInt, src address.Address, method uint64, params []byte) (cid.Cid, error) {
+	return a.msigApproveOrCancelTxnHash(ctx, api.MsigApprove, msig, txID, proposer, to, amt, src, method, params)
 }
 
 func (a *MsigAPI) MsigCancel(ctx context.Context, msig address.Address, txID uint64, to address.Address, amt types.BigInt, src address.Address, method uint64, params []byte) (cid.Cid, error) {
-	return a.msigApproveOrCancel(ctx, api.MsigCancel, msig, txID, src, to, amt, src, method, params)
+	return a.msigApproveOrCancelTxnHash(ctx, api.MsigCancel, msig, txID, src, to, amt, src, method, params)
 }
 
-func (a *MsigAPI) msigApproveOrCancel(ctx context.Context, operation api.MsigProposeResponse, msig address.Address, txID uint64, proposer address.Address, to address.Address, amt types.BigInt, src address.Address, method uint64, params []byte) (cid.Cid, error) {
+func (a *MsigAPI) MsigRemoveSigner(ctx context.Context, msig address.Address, proposer address.Address, toRemove address.Address, decrease bool) (cid.Cid, error) {
+	enc, actErr := serializeRemoveParams(toRemove, decrease)
+	if actErr != nil {
+		return cid.Undef, actErr
+	}
+
+	return a.MsigPropose(ctx, msig, msig, types.NewInt(0), proposer, uint64(builtin0.MethodsMultisig.RemoveSigner), enc)
+}
+
+func (a *MsigAPI) msigApproveOrCancelSimple(ctx context.Context, operation api.MsigProposeResponse, msig address.Address, txID uint64, src address.Address) (cid.Cid, error) {
 	if msig == address.Undef {
 		return cid.Undef, xerrors.Errorf("must provide multisig address")
 	}
 
-	if to == address.Undef {
-		return cid.Undef, xerrors.Errorf("must provide proposed target address")
+	if src == address.Undef {
+		return cid.Undef, xerrors.Errorf("must provide source address")
 	}
 
-	if amt.Sign() == -1 {
-		return cid.Undef, xerrors.Errorf("must provide the positive amount that was proposed")
+	mb, err := a.messageBuilder(ctx, src)
+	if err != nil {
+		return cid.Undef, err
+	}
+
+	var msg *types.Message
+	switch operation {
+	case api.MsigApprove:
+		msg, err = mb.Approve(msig, txID, nil)
+	case api.MsigCancel:
+		msg, err = mb.Cancel(msig, txID, nil)
+	default:
+		return cid.Undef, xerrors.Errorf("Invalid operation for msigApproveOrCancel")
+	}
+	if err != nil {
+		return cid.Undef, err
+	}
+
+	smsg, err := a.MpoolAPI.MpoolPushMessage(ctx, msg, nil)
+	if err != nil {
+		return cid.Undef, err
+	}
+
+	return smsg.Cid(), nil
+
+}
+
+func (a *MsigAPI) msigApproveOrCancelTxnHash(ctx context.Context, operation api.MsigProposeResponse, msig address.Address, txID uint64, proposer address.Address, to address.Address, amt types.BigInt, src address.Address, method uint64, params []byte) (cid.Cid, error) {
+	if msig == address.Undef {
+		return cid.Undef, xerrors.Errorf("must provide multisig address")
 	}
 
 	if src == address.Undef {
@@ -196,7 +207,7 @@ func (a *MsigAPI) msigApproveOrCancel(ctx context.Context, operation api.MsigPro
 		proposer = proposerID
 	}
 
-	p := samsig.ProposalHashData{
+	p := multisig.ProposalHashData{
 		Requester: proposer,
 		To:        to,
 		Value:     amt,
@@ -204,47 +215,25 @@ func (a *MsigAPI) msigApproveOrCancel(ctx context.Context, operation api.MsigPro
 		Params:    params,
 	}
 
-	pser, err := p.Serialize()
-	if err != nil {
-		return cid.Undef, err
-	}
-	phash := blake2b.Sum256(pser)
-
-	enc, err := actors.SerializeParams(&samsig.TxnIDParams{
-		ID:           samsig.TxnID(txID),
-		ProposalHash: phash[:],
-	})
-
+	mb, err := a.messageBuilder(ctx, src)
 	if err != nil {
 		return cid.Undef, err
 	}
 
-	var msigResponseMethod abi.MethodNum
-
-	/*
-		We pass in a MsigProposeResponse instead of MethodNum to
-		tighten the possible inputs to just Approve and Cancel.
-	*/
+	var msg *types.Message
 	switch operation {
 	case api.MsigApprove:
-		msigResponseMethod = builtin.MethodsMultisig.Approve
+		msg, err = mb.Approve(msig, txID, &p)
 	case api.MsigCancel:
-		msigResponseMethod = builtin.MethodsMultisig.Cancel
+		msg, err = mb.Cancel(msig, txID, &p)
 	default:
 		return cid.Undef, xerrors.Errorf("Invalid operation for msigApproveOrCancel")
 	}
-
-	msg := &types.Message{
-		To:       msig,
-		From:     src,
-		Value:    types.NewInt(0),
-		Method:   msigResponseMethod,
-		Params:   enc,
-		GasLimit: 100000,
-		GasPrice: types.NewInt(1),
+	if err != nil {
+		return cid.Undef, err
 	}
 
-	smsg, err := a.MpoolAPI.MpoolPushMessage(ctx, msg)
+	smsg, err := a.MpoolAPI.MpoolPushMessage(ctx, msg, nil)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -252,10 +241,34 @@ func (a *MsigAPI) msigApproveOrCancel(ctx context.Context, operation api.MsigPro
 	return smsg.Cid(), nil
 }
 
+func serializeAddParams(new address.Address, inc bool) ([]byte, error) {
+	enc, actErr := actors.SerializeParams(&multisig0.AddSignerParams{
+		Signer:   new,
+		Increase: inc,
+	})
+	if actErr != nil {
+		return nil, actErr
+	}
+
+	return enc, nil
+}
+
 func serializeSwapParams(old address.Address, new address.Address) ([]byte, error) {
-	enc, actErr := actors.SerializeParams(&samsig.SwapSignerParams{
+	enc, actErr := actors.SerializeParams(&multisig0.SwapSignerParams{
 		From: old,
 		To:   new,
+	})
+	if actErr != nil {
+		return nil, actErr
+	}
+
+	return enc, nil
+}
+
+func serializeRemoveParams(rem address.Address, dec bool) ([]byte, error) {
+	enc, actErr := actors.SerializeParams(&multisig0.RemoveSignerParams{
+		Signer:   rem,
+		Decrease: dec,
 	})
 	if actErr != nil {
 		return nil, actErr

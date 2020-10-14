@@ -8,15 +8,15 @@ import (
 	"os"
 
 	"github.com/docker/go-units"
-	"github.com/filecoin-project/sector-storage/ffiwrapper"
+	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
 
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/mitchellh/go-homedir"
 	"github.com/urfave/cli/v2"
 
 	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"github.com/filecoin-project/specs-actors/actors/abi/big"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
 
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -114,6 +114,9 @@ var preSealCmd = &cli.Command{
 				return err
 			}
 			kb, err := hex.DecodeString(string(kh))
+			if err != nil {
+				return err
+			}
 			if err := json.Unmarshal(kb, k); err != nil {
 				return err
 			}
@@ -155,6 +158,9 @@ var aggregateManifestsCmd = &cli.Command{
 			}
 
 			inputs = append(inputs, val)
+			if err := fi.Close(); err != nil {
+				return err
+			}
 		}
 
 		output := make(map[string]genesis.Miner)

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"os"
 
 	"github.com/urfave/cli/v2"
 	"go.opencensus.io/trace"
@@ -17,10 +16,13 @@ import (
 var AdvanceBlockCmd *cli.Command
 
 func main() {
+	build.RunningNodeType = build.NodeFull
+
 	lotuslog.SetupLogLevels()
 
 	local := []*cli.Command{
 		DaemonCmd,
+		backupCmd,
 	}
 	if AdvanceBlockCmd != nil {
 		local = append(local, AdvanceBlockCmd)
@@ -69,17 +71,5 @@ func main() {
 	app.Metadata["traceContext"] = ctx
 	app.Metadata["repoType"] = repo.FullNode
 
-	if err := app.Run(os.Args); err != nil {
-		span.SetStatus(trace.Status{
-			Code:    trace.StatusCodeFailedPrecondition,
-			Message: err.Error(),
-		})
-		_, ok := err.(*lcli.ErrCmdFailed)
-		if ok {
-			log.Debugf("%+v", err)
-		} else {
-			log.Warnf("%+v", err)
-		}
-		os.Exit(1)
-	}
+	lcli.RunApp(app)
 }

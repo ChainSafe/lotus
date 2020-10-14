@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -8,16 +9,22 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path"
 	"strings"
 	"text/template"
 
 	"github.com/urfave/cli/v2"
+
+	"golang.org/x/xerrors"
+
+	"github.com/multiformats/go-base32"
 
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
 
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/wallet"
+	"github.com/filecoin-project/lotus/node/modules"
 	"github.com/filecoin-project/lotus/node/modules/lp2p"
 	"github.com/filecoin-project/lotus/node/repo"
 
@@ -25,10 +32,10 @@ import (
 	_ "github.com/filecoin-project/lotus/lib/sigs/secp"
 )
 
-var validTypes = []string{wallet.KTBLS, wallet.KTSecp256k1, lp2p.KTLibp2pHost}
+var validTypes = []types.KeyType{types.KTBLS, types.KTSecp256k1, lp2p.KTLibp2pHost}
 
 type keyInfoOutput struct {
-	Type      string
+	Type      types.KeyType
 	Address   string
 	PublicKey string
 }
@@ -42,6 +49,90 @@ var keyinfoCmd = &cli.Command{
 		keyinfoNewCmd,
 		keyinfoInfoCmd,
 		keyinfoImportCmd,
+		keyinfoVerifyCmd,
+	},
+}
+
+var keyinfoVerifyCmd = &cli.Command{
+	Name:  "verify",
+	Usage: "verify the filename of a keystore object on disk with it's contents",
+	Description: `Keystore objects are base32 enocded strings, with wallets being dynamically named via
+   the wallet address. This command can ensure that the naming of these keystore objects are correct`,
+	Action: func(cctx *cli.Context) error {
+		filePath := cctx.Args().First()
+		fileName := path.Base(filePath)
+
+		inputFile, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		defer inputFile.Close() //nolint:errcheck
+		input := bufio.NewReader(inputFile)
+
+		keyContent, err := ioutil.ReadAll(input)
+		if err != nil {
+			return err
+		}
+
+		var keyInfo types.KeyInfo
+		if err := json.Unmarshal(keyContent, &keyInfo); err != nil {
+			return err
+		}
+
+		switch keyInfo.Type {
+		case lp2p.KTLibp2pHost:
+			name, err := base32.RawStdEncoding.DecodeString(fileName)
+			if err != nil {
+				return xerrors.Errorf("decoding key: '%s': %w", fileName, err)
+			}
+
+			if types.KeyType(name) != keyInfo.Type {
+				return fmt.Errorf("%s of type %s is incorrect", fileName, keyInfo.Type)
+			}
+		case modules.KTJwtHmacSecret:
+			name, err := base32.RawStdEncoding.DecodeString(fileName)
+			if err != nil {
+				return xerrors.Errorf("decoding key: '%s': %w", fileName, err)
+			}
+
+			if string(name) != modules.JWTSecretName {
+				return fmt.Errorf("%s of type %s is incorrect", fileName, keyInfo.Type)
+			}
+		case types.KTSecp256k1, types.KTBLS:
+			keystore := wallet.NewMemKeyStore()
+			w, err := wallet.NewWallet(keystore)
+			if err != nil {
+				return err
+			}
+
+			if _, err := w.WalletImport(cctx.Context, &keyInfo); err != nil {
+				return err
+			}
+
+			list, err := keystore.List()
+			if err != nil {
+				return err
+			}
+
+			if len(list) != 1 {
+				return fmt.Errorf("Unexpected number of keys, expected 1, found %d", len(list))
+			}
+
+			name, err := base32.RawStdEncoding.DecodeString(fileName)
+			if err != nil {
+				return xerrors.Errorf("decoding key: '%s': %w", fileName, err)
+			}
+
+			if string(name) != list[0] {
+				return fmt.Errorf("%s of type %s; file is named for %s, but key is actually %s", fileName, keyInfo.Type, string(name), list[0])
+			}
+
+			break
+		default:
+			return fmt.Errorf("Unknown keytype %s", keyInfo.Type)
+		}
+
+		return nil
 	},
 }
 
@@ -64,10 +155,12 @@ var keyinfoImportCmd = &cli.Command{
 			input = os.Stdin
 		} else {
 			var err error
-			input, err = os.Open(cctx.Args().First())
+			inputFile, err := os.Open(cctx.Args().First())
 			if err != nil {
 				return err
 			}
+			defer inputFile.Close() //nolint:errcheck
+			input = bufio.NewReader(inputFile)
 		}
 
 		encoded, err := ioutil.ReadAll(input)
@@ -95,7 +188,7 @@ var keyinfoImportCmd = &cli.Command{
 			return err
 		}
 
-		defer lkrepo.Close()
+		defer lkrepo.Close() //nolint:errcheck
 
 		keystore, err := lkrepo.KeyStore()
 		if err != nil {
@@ -121,13 +214,13 @@ var keyinfoImportCmd = &cli.Command{
 			fmt.Printf("%s\n", peerid.String())
 
 			break
-		case wallet.KTSecp256k1, wallet.KTBLS:
+		case types.KTSecp256k1, types.KTBLS:
 			w, err := wallet.NewWallet(keystore)
 			if err != nil {
 				return err
 			}
 
-			addr, err := w.Import(&keyInfo)
+			addr, err := w.WalletImport(cctx.Context, &keyInfo)
 			if err != nil {
 				return err
 			}
@@ -147,7 +240,7 @@ var keyinfoInfoCmd = &cli.Command{
 
    The 'format' flag takes a golang text/template template as its value.
 
-   The following fields can be retrived through this command
+   The following fields can be retrieved through this command
      Type
      Address
      PublicKey
@@ -156,7 +249,7 @@ var keyinfoInfoCmd = &cli.Command{
 
    Examples
 
-   Retreive the address of a lotus wallet
+   Retrieve the address of a lotus wallet
    lotus-shed keyinfo info --format '{{ .Address }}' wallet.keyinfo
    `,
 	Flags: []cli.Flag{
@@ -174,10 +267,12 @@ var keyinfoInfoCmd = &cli.Command{
 			input = os.Stdin
 		} else {
 			var err error
-			input, err = os.Open(cctx.Args().First())
+			inputFile, err := os.Open(cctx.Args().First())
 			if err != nil {
 				return err
 			}
+			defer inputFile.Close() //nolint:errcheck
+			input = bufio.NewReader(inputFile)
 		}
 
 		encoded, err := ioutil.ReadAll(input)
@@ -222,7 +317,7 @@ var keyinfoInfoCmd = &cli.Command{
 			kio.PublicKey = base64.StdEncoding.EncodeToString(pkBytes)
 
 			break
-		case wallet.KTSecp256k1, wallet.KTBLS:
+		case types.KTSecp256k1, types.KTBLS:
 			kio.Type = keyInfo.Type
 
 			key, err := wallet.NewKey(keyInfo)
@@ -271,7 +366,7 @@ var keyinfoNewCmd = &cli.Command{
 			return fmt.Errorf("please specify a type to generate")
 		}
 
-		keyType := cctx.Args().First()
+		keyType := types.KeyType(cctx.Args().First())
 		flagOutput := cctx.String("output")
 
 		if i := SliceIndex(len(validTypes), func(i int) bool {
@@ -309,8 +404,8 @@ var keyinfoNewCmd = &cli.Command{
 			keyInfo = ki
 
 			break
-		case wallet.KTSecp256k1, wallet.KTBLS:
-			key, err := wallet.GenerateKey(wallet.ActSigType(keyType))
+		case types.KTSecp256k1, types.KTBLS:
+			key, err := wallet.GenerateKey(keyType)
 			if err != nil {
 				return err
 			}
@@ -323,9 +418,9 @@ var keyinfoNewCmd = &cli.Command{
 
 		filename := flagOutput
 		filename = strings.ReplaceAll(filename, "<addr>", keyAddr)
-		filename = strings.ReplaceAll(filename, "<type>", keyType)
+		filename = strings.ReplaceAll(filename, "<type>", string(keyType))
 
-		file, err := os.Create(filename)
+		file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 		if err != nil {
 			return err
 		}

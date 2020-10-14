@@ -5,7 +5,7 @@ import (
 	"math"
 	"sync"
 
-	"github.com/filecoin-project/specs-actors/actors/abi"
+	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
 
@@ -307,7 +307,10 @@ func (e *hcEvents) onHeadChanged(check CheckFunc, hnd EventHandler, rev RevertHa
 	defer e.lk.Unlock()
 
 	// Check if the event has already occurred
-	ts := e.tsc.best()
+	ts, err := e.tsc.best()
+	if err != nil {
+		return 0, xerrors.Errorf("error getting best tipset: %w", err)
+	}
 	done, more, err := check(ts)
 	if err != nil {
 		return 0, xerrors.Errorf("called check error (h: %d): %w", ts.Height(), err)
@@ -485,13 +488,15 @@ func (me *messageEvents) checkNewCalls(ts *types.TipSet) (map[triggerID]eventDat
 
 		for tid, matchFns := range me.matchers {
 			var matched bool
+			var once bool
 			for _, matchFn := range matchFns {
-				ok, err := matchFn(msg)
+				matchOne, ok, err := matchFn(msg)
 				if err != nil {
 					log.Errorf("event matcher failed: %s", err)
 					continue
 				}
 				matched = ok
+				once = matchOne
 
 				if matched {
 					break
@@ -500,7 +505,9 @@ func (me *messageEvents) checkNewCalls(ts *types.TipSet) (map[triggerID]eventDat
 
 			if matched {
 				res[tid] = msg
-				break
+				if once {
+					break
+				}
 			}
 		}
 	})
@@ -548,7 +555,7 @@ func (me *messageEvents) messagesForTs(ts *types.TipSet, consume func(*types.Mes
 // `curH`-`ts.Height` = `confidence`
 type MsgHandler func(msg *types.Message, rec *types.MessageReceipt, ts *types.TipSet, curH abi.ChainEpoch) (more bool, err error)
 
-type MsgMatchFunc func(msg *types.Message) (bool, error)
+type MsgMatchFunc func(msg *types.Message) (matchOnce bool, matched bool, err error)
 
 // Called registers a callback which is triggered when a specified method is
 //  called on an actor, or a timeout is reached.

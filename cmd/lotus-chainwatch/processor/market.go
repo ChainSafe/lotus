@@ -8,6 +8,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 
+	"github.com/filecoin-project/lotus/chain/actors/builtin/market"
 	"github.com/filecoin-project/lotus/chain/events/state"
 )
 
@@ -59,6 +60,20 @@ create table if not exists market_deal_states
 	constraint market_deal_states_pk
 		primary key (deal_id, state_root)
     
+);
+
+create table if not exists minerid_dealid_sectorid 
+(
+    deal_id bigint not null
+        constraint sectors_sector_ids_id_fk
+            references market_deal_proposals(deal_id),
+
+    sector_id bigint not null,
+    miner_id text not null,
+    foreign key (sector_id, miner_id) references sector_precommit_info(sector_id, miner_id),
+
+    constraint miner_sector_deal_ids_pk
+        primary key (miner_id, sector_id, deal_id)
 );
 
 `); err != nil {
@@ -279,7 +294,7 @@ func (p *Processor) updateMarketActorDealProposals(ctx context.Context, marketTi
 		if !changed {
 			continue
 		}
-		changes, ok := val.(*state.MarketDealStateChanges)
+		changes, ok := val.(*market.DealStateChanges)
 		if !ok {
 			return xerrors.Errorf("Unknown type returned by Deal State AMT predicate: %T", val)
 		}

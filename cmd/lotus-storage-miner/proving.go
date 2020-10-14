@@ -1,21 +1,18 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"os"
+	"strconv"
 	"text/tabwriter"
-	"time"
 
+	"github.com/fatih/color"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/go-bitfield"
-	rlepluslazy "github.com/filecoin-project/go-bitfield/rle"
-	"github.com/filecoin-project/specs-actors/actors/abi"
-	"github.com/filecoin-project/specs-actors/actors/builtin/miner"
-
-	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/api/apibstore"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
+	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 )
@@ -26,6 +23,7 @@ var provingCmd = &cli.Command{
 	Subcommands: []*cli.Command{
 		provingInfoCmd,
 		provingDeadlinesCmd,
+		provingDeadlineInfoCmd,
 		provingFaultsCmd,
 	},
 }
@@ -34,6 +32,8 @@ var provingFaultsCmd = &cli.Command{
 	Name:  "faults",
 	Usage: "View the currently known proving faulty sectors information",
 	Action: func(cctx *cli.Context) error {
+		color.NoColor = !cctx.Bool("color")
+
 		nodeApi, closer, err := lcli.GetStorageMinerAPI(cctx)
 		if err != nil {
 			return err
@@ -48,52 +48,41 @@ var provingFaultsCmd = &cli.Command{
 
 		ctx := lcli.ReqContext(cctx)
 
+		stor := store.ActorStore(ctx, apibstore.NewAPIBlockstore(api))
+
 		maddr, err := getActorAddress(ctx, nodeApi, cctx.String("actor"))
 		if err != nil {
 			return err
 		}
 
-		var mas miner.State
-		{
-			mact, err := api.StateGetActor(ctx, maddr, types.EmptyTSK)
-			if err != nil {
-				return err
-			}
-			rmas, err := api.ChainReadObj(ctx, mact.Head)
-			if err != nil {
-				return err
-			}
-			if err := mas.UnmarshalCBOR(bytes.NewReader(rmas)); err != nil {
-				return err
-			}
-		}
-		faults, err := mas.Faults.All(100000000000)
+		mact, err := api.StateGetActor(ctx, maddr, types.EmptyTSK)
 		if err != nil {
 			return err
 		}
-		if len(faults) == 0 {
-			fmt.Println("no faulty sectors")
-			return nil
-		}
-		head, err := api.ChainHead(ctx)
-		if err != nil {
-			return xerrors.Errorf("getting chain head: %w", err)
-		}
-		deadlines, err := api.StateMinerDeadlines(ctx, maddr, head.Key())
-		if err != nil {
-			return xerrors.Errorf("getting miner deadlines: %w", err)
-		}
-		tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		_, _ = fmt.Fprintln(tw, "deadline\tsectors")
-		for deadline, sectors := range deadlines.Due {
-			intersectSectors, _ := bitfield.IntersectBitField(sectors, mas.Faults)
-			if intersectSectors != nil {
-				allSectors, _ := intersectSectors.All(100000000000)
-				for _, num := range allSectors {
-					_, _ = fmt.Fprintf(tw, "%d\t%d\n", deadline, num)
-				}
-			}
 
+		mas, err := miner.Load(stor, mact)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Miner: %s\n", color.BlueString("%s", maddr))
+
+		tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		_, _ = fmt.Fprintln(tw, "deadline\tpartition\tsectors")
+		err = mas.ForEachDeadline(func(dlIdx uint64, dl miner.Deadline) error {
+			return dl.ForEachPartition(func(partIdx uint64, part miner.Partition) error {
+				faults, err := part.FaultySectors()
+				if err != nil {
+					return err
+				}
+				return faults.ForEach(func(num uint64) error {
+					_, _ = fmt.Fprintf(tw, "%d\t%d\t%d\n", dlIdx, partIdx, num)
+					return nil
+				})
+			})
+		})
+		if err != nil {
+			return err
 		}
 		return tw.Flush()
 	},
@@ -103,6 +92,8 @@ var provingInfoCmd = &cli.Command{
 	Name:  "info",
 	Usage: "View current state information",
 	Action: func(cctx *cli.Context) error {
+		color.NoColor = !cctx.Bool("color")
+
 		nodeApi, closer, err := lcli.GetStorageMinerAPI(cctx)
 		if err != nil {
 			return err
@@ -127,108 +118,95 @@ var provingInfoCmd = &cli.Command{
 			return xerrors.Errorf("getting chain head: %w", err)
 		}
 
+		mact, err := api.StateGetActor(ctx, maddr, head.Key())
+		if err != nil {
+			return err
+		}
+
+		stor := store.ActorStore(ctx, apibstore.NewAPIBlockstore(api))
+
+		mas, err := miner.Load(stor, mact)
+		if err != nil {
+			return err
+		}
+
 		cd, err := api.StateMinerProvingDeadline(ctx, maddr, head.Key())
 		if err != nil {
 			return xerrors.Errorf("getting miner info: %w", err)
 		}
 
-		deadlines, err := api.StateMinerDeadlines(ctx, maddr, head.Key())
-		if err != nil {
-			return xerrors.Errorf("getting miner deadlines: %w", err)
-		}
+		fmt.Printf("Miner: %s\n", color.BlueString("%s", maddr))
 
-		var mas miner.State
-		{
-			mact, err := api.StateGetActor(ctx, maddr, types.EmptyTSK)
-			if err != nil {
-				return err
-			}
-			rmas, err := api.ChainReadObj(ctx, mact.Head)
-			if err != nil {
-				return err
-			}
-			if err := mas.UnmarshalCBOR(bytes.NewReader(rmas)); err != nil {
-				return err
-			}
-		}
+		proving := uint64(0)
+		faults := uint64(0)
+		recovering := uint64(0)
+		curDeadlineSectors := uint64(0)
 
-		newSectors, err := mas.NewSectors.Count()
-		if err != nil {
-			return err
-		}
+		if err := mas.ForEachDeadline(func(dlIdx uint64, dl miner.Deadline) error {
+			return dl.ForEachPartition(func(partIdx uint64, part miner.Partition) error {
+				if bf, err := part.LiveSectors(); err != nil {
+					return err
+				} else if count, err := bf.Count(); err != nil {
+					return err
+				} else {
+					proving += count
+					if dlIdx == cd.Index {
+						curDeadlineSectors += count
+					}
+				}
 
-		faults, err := mas.Faults.Count()
-		if err != nil {
-			return err
-		}
+				if bf, err := part.FaultySectors(); err != nil {
+					return err
+				} else if count, err := bf.Count(); err != nil {
+					return err
+				} else {
+					faults += count
+				}
 
-		recoveries, err := mas.Recoveries.Count()
-		if err != nil {
-			return err
-		}
+				if bf, err := part.RecoveringSectors(); err != nil {
+					return err
+				} else if count, err := bf.Count(); err != nil {
+					return err
+				} else {
+					recovering += count
+				}
 
-		var provenSectors uint64
-		for _, d := range deadlines.Due {
-			c, err := d.Count()
-			if err != nil {
-				return err
-			}
-			provenSectors += c
+				return nil
+			})
+		}); err != nil {
+			return xerrors.Errorf("walking miner deadlines and partitions: %w", err)
 		}
 
 		var faultPerc float64
-		if provenSectors > 0 {
-			faultPerc = float64(faults*10000/provenSectors) / 100
+		if proving > 0 {
+			faultPerc = float64(faults*10000/proving) / 100
 		}
 
 		fmt.Printf("Current Epoch:           %d\n", cd.CurrentEpoch)
-		fmt.Printf("Chain Period:            %d\n", cd.CurrentEpoch/miner.WPoStProvingPeriod)
-		fmt.Printf("Chain Period Start:      %s\n", epochTime(cd.CurrentEpoch, (cd.CurrentEpoch/miner.WPoStProvingPeriod)*miner.WPoStProvingPeriod))
-		fmt.Printf("Chain Period End:        %s\n\n", epochTime(cd.CurrentEpoch, (cd.CurrentEpoch/miner.WPoStProvingPeriod+1)*miner.WPoStProvingPeriod))
 
-		fmt.Printf("Proving Period Boundary: %d\n", cd.PeriodStart%miner.WPoStProvingPeriod)
-		fmt.Printf("Proving Period Start:    %s\n", epochTime(cd.CurrentEpoch, cd.PeriodStart))
-		fmt.Printf("Next Period Start:       %s\n\n", epochTime(cd.CurrentEpoch, cd.PeriodStart+miner.WPoStProvingPeriod))
+		fmt.Printf("Proving Period Boundary: %d\n", cd.PeriodStart%cd.WPoStProvingPeriod)
+		fmt.Printf("Proving Period Start:    %s\n", lcli.EpochTime(cd.CurrentEpoch, cd.PeriodStart))
+		fmt.Printf("Next Period Start:       %s\n\n", lcli.EpochTime(cd.CurrentEpoch, cd.PeriodStart+cd.WPoStProvingPeriod))
 
 		fmt.Printf("Faults:      %d (%.2f%%)\n", faults, faultPerc)
-		fmt.Printf("Recovering:  %d\n", recoveries)
-		fmt.Printf("New Sectors: %d\n\n", newSectors)
+		fmt.Printf("Recovering:  %d\n", recovering)
 
 		fmt.Printf("Deadline Index:       %d\n", cd.Index)
-
-		if cd.Index < uint64(len(deadlines.Due)) {
-			curDeadlineSectors, err := deadlines.Due[cd.Index].Count()
-			if err != nil {
-				return xerrors.Errorf("counting deadline sectors: %w", err)
-			}
-			fmt.Printf("Deadline Sectors:     %d\n", curDeadlineSectors)
-		}
-
-		fmt.Printf("Deadline Open:        %s\n", epochTime(cd.CurrentEpoch, cd.Open))
-		fmt.Printf("Deadline Close:       %s\n", epochTime(cd.CurrentEpoch, cd.Close))
-		fmt.Printf("Deadline Challenge:   %s\n", epochTime(cd.CurrentEpoch, cd.Challenge))
-		fmt.Printf("Deadline FaultCutoff: %s\n", epochTime(cd.CurrentEpoch, cd.FaultCutoff))
+		fmt.Printf("Deadline Sectors:     %d\n", curDeadlineSectors)
+		fmt.Printf("Deadline Open:        %s\n", lcli.EpochTime(cd.CurrentEpoch, cd.Open))
+		fmt.Printf("Deadline Close:       %s\n", lcli.EpochTime(cd.CurrentEpoch, cd.Close))
+		fmt.Printf("Deadline Challenge:   %s\n", lcli.EpochTime(cd.CurrentEpoch, cd.Challenge))
+		fmt.Printf("Deadline FaultCutoff: %s\n", lcli.EpochTime(cd.CurrentEpoch, cd.FaultCutoff))
 		return nil
 	},
-}
-
-func epochTime(curr, e abi.ChainEpoch) string {
-	switch {
-	case curr > e:
-		return fmt.Sprintf("%d (%s ago)", e, time.Second*time.Duration(int64(build.BlockDelaySecs)*int64(curr-e)))
-	case curr == e:
-		return fmt.Sprintf("%d (now)", e)
-	case curr < e:
-		return fmt.Sprintf("%d (in %s)", e, time.Second*time.Duration(int64(build.BlockDelaySecs)*int64(e-curr)))
-	}
-
-	panic("math broke")
 }
 
 var provingDeadlinesCmd = &cli.Command{
 	Name:  "deadlines",
 	Usage: "View the current proving period deadlines information",
 	Action: func(cctx *cli.Context) error {
+		color.NoColor = !cctx.Bool("color")
+
 		nodeApi, closer, err := lcli.GetStorageMinerAPI(cctx)
 		if err != nil {
 			return err
@@ -258,74 +236,138 @@ var provingDeadlinesCmd = &cli.Command{
 			return xerrors.Errorf("getting deadlines: %w", err)
 		}
 
-		var mas miner.State
-		{
-			mact, err := api.StateGetActor(ctx, maddr, types.EmptyTSK)
-			if err != nil {
-				return err
-			}
-			rmas, err := api.ChainReadObj(ctx, mact.Head)
-			if err != nil {
-				return err
-			}
-			if err := mas.UnmarshalCBOR(bytes.NewReader(rmas)); err != nil {
-				return err
-			}
-		}
+		fmt.Printf("Miner: %s\n", color.BlueString("%s", maddr))
 
 		tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		_, _ = fmt.Fprintln(tw, "deadline\tsectors\tpartitions\tproven")
+		_, _ = fmt.Fprintln(tw, "deadline\tpartitions\tsectors (faults)\tproven partitions")
 
-		for i, field := range deadlines.Due {
-			c, err := field.Count()
+		for dlIdx, deadline := range deadlines {
+			partitions, err := api.StateMinerPartitions(ctx, maddr, uint64(dlIdx), types.EmptyTSK)
+			if err != nil {
+				return xerrors.Errorf("getting partitions for deadline %d: %w", dlIdx, err)
+			}
+
+			provenPartitions, err := deadline.PostSubmissions.Count()
 			if err != nil {
 				return err
 			}
 
-			firstPartition, sectorCount, err := miner.PartitionsForDeadline(deadlines, mas.Info.WindowPoStPartitionSectors, uint64(i))
-			if err != nil {
-				return err
-			}
+			sectors := uint64(0)
+			faults := uint64(0)
 
-			partitionCount := (sectorCount + mas.Info.WindowPoStPartitionSectors - 1) / mas.Info.WindowPoStPartitionSectors
-
-			var provenPartitions uint64
-			{
-				var maskRuns []rlepluslazy.Run
-				if firstPartition > 0 {
-					maskRuns = append(maskRuns, rlepluslazy.Run{
-						Val: false,
-						Len: firstPartition,
-					})
-				}
-				maskRuns = append(maskRuns, rlepluslazy.Run{
-					Val: true,
-					Len: partitionCount,
-				})
-
-				ppbm, err := bitfield.NewFromIter(&rlepluslazy.RunSliceIterator{Runs: maskRuns})
+			for _, partition := range partitions {
+				sc, err := partition.AllSectors.Count()
 				if err != nil {
 					return err
 				}
 
-				pp, err := bitfield.IntersectBitField(ppbm, mas.PostSubmissions)
+				sectors += sc
+
+				fc, err := partition.FaultySectors.Count()
 				if err != nil {
 					return err
 				}
 
-				provenPartitions, err = pp.Count()
-				if err != nil {
-					return err
-				}
+				faults += fc
 			}
 
 			var cur string
-			if di.Index == uint64(i) {
+			if di.Index == uint64(dlIdx) {
 				cur += "\t(current)"
 			}
-			_, _ = fmt.Fprintf(tw, "%d\t%d\t%d\t%d%s\n", i, c, partitionCount, provenPartitions, cur)
+			_, _ = fmt.Fprintf(tw, "%d\t%d\t%d (%d)\t%d%s\n", dlIdx, len(partitions), sectors, faults, provenPartitions, cur)
 		}
 
 		return tw.Flush()
+	},
+}
+
+var provingDeadlineInfoCmd = &cli.Command{
+	Name:      "deadline",
+	Usage:     "View the current proving period deadline information by its index ",
+	ArgsUsage: "<deadlineIdx>",
+	Action: func(cctx *cli.Context) error {
+
+		if cctx.Args().Len() != 1 {
+			return xerrors.Errorf("must pass deadline index")
+		}
+
+		dlIdx, err := strconv.ParseUint(cctx.Args().Get(0), 10, 64)
+		if err != nil {
+			return xerrors.Errorf("could not parse deadline index: %w", err)
+		}
+
+		nodeApi, closer, err := lcli.GetStorageMinerAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		api, acloser, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer acloser()
+
+		ctx := lcli.ReqContext(cctx)
+
+		maddr, err := getActorAddress(ctx, nodeApi, cctx.String("actor"))
+		if err != nil {
+			return err
+		}
+
+		deadlines, err := api.StateMinerDeadlines(ctx, maddr, types.EmptyTSK)
+		if err != nil {
+			return xerrors.Errorf("getting deadlines: %w", err)
+		}
+
+		di, err := api.StateMinerProvingDeadline(ctx, maddr, types.EmptyTSK)
+		if err != nil {
+			return xerrors.Errorf("getting deadlines: %w", err)
+		}
+
+		partitions, err := api.StateMinerPartitions(ctx, maddr, dlIdx, types.EmptyTSK)
+		if err != nil {
+			return xerrors.Errorf("getting partitions for deadline %d: %w", dlIdx, err)
+		}
+
+		provenPartitions, err := deadlines[dlIdx].PostSubmissions.Count()
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Deadline Index:           %d\n", dlIdx)
+		fmt.Printf("Partitions:               %d\n", len(partitions))
+		fmt.Printf("Proven Partitions:        %d\n", provenPartitions)
+		fmt.Printf("Current:                  %t\n\n", di.Index == dlIdx)
+
+		for pIdx, partition := range partitions {
+			sectorCount, err := partition.AllSectors.Count()
+			if err != nil {
+				return err
+			}
+
+			sectorNumbers, err := partition.AllSectors.All(sectorCount)
+			if err != nil {
+				return err
+			}
+
+			faultsCount, err := partition.FaultySectors.Count()
+			if err != nil {
+				return err
+			}
+
+			fn, err := partition.FaultySectors.All(faultsCount)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("Partition Index:          %d\n", pIdx)
+			fmt.Printf("Sectors:                  %d\n", sectorCount)
+			fmt.Printf("Sector Numbers:           %v\n", sectorNumbers)
+			fmt.Printf("Faults:                   %d\n", faultsCount)
+			fmt.Printf("Faulty Sectors:           %d\n", fn)
+		}
+		return nil
 	},
 }

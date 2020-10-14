@@ -7,7 +7,7 @@ import (
 	gen "github.com/whyrusleeping/cbor-gen"
 
 	"github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/chain/blocksync"
+	"github.com/filecoin-project/lotus/chain/exchange"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/node/hello"
 	"github.com/filecoin-project/lotus/paychmgr"
@@ -26,6 +26,8 @@ func main() {
 		types.BlockMsg{},
 		types.ExpTipSet{},
 		types.BeaconEntry{},
+		types.StateRoot{},
+		types.StateInfo0{},
 	)
 	if err != nil {
 		fmt.Println(err)
@@ -35,6 +37,7 @@ func main() {
 	err = gen.WriteMapEncodersToFile("./paychmgr/cbor_gen.go", "paychmgr",
 		paychmgr.VoucherInfo{},
 		paychmgr.ChannelInfo{},
+		paychmgr.MsgInfo{},
 	)
 	if err != nil {
 		fmt.Println(err)
@@ -62,14 +65,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = gen.WriteTupleEncodersToFile("./chain/blocksync/cbor_gen.go", "blocksync",
-		blocksync.BlockSyncRequest{},
-		blocksync.BlockSyncResponse{},
-		blocksync.BSTipSet{},
+	err = gen.WriteTupleEncodersToFile("./chain/exchange/cbor_gen.go", "exchange",
+		exchange.Request{},
+		exchange.Response{},
+		exchange.CompactedMessages{},
+		exchange.BSTipSet{},
 	)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-
 }

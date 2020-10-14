@@ -5,11 +5,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/metrics"
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
 	"go.opencensus.io/stats"
 	"go.uber.org/fx"
+	"go.uber.org/multierr"
+	"golang.org/x/xerrors"
 
+	"github.com/libp2p/go-libp2p-core/event"
 	host "github.com/libp2p/go-libp2p-core/host"
 	net "github.com/libp2p/go-libp2p-core/network"
 	peer "github.com/libp2p/go-libp2p-core/peer"
@@ -49,10 +53,17 @@ type PeerMgr struct {
 	h   host.Host
 	dht *dht.IpfsDHT
 
-	notifee *net.NotifyBundle
+	notifee        *net.NotifyBundle
+	filPeerEmitter event.Emitter
+
+	done chan struct{}
 }
 
-func NewPeerMgr(h host.Host, dht *dht.IpfsDHT, bootstrap dtypes.BootstrapPeers) *PeerMgr {
+type NewFilPeer struct {
+	Id peer.ID
+}
+
+func NewPeerMgr(lc fx.Lifecycle, h host.Host, dht *dht.IpfsDHT, bootstrap dtypes.BootstrapPeers) (*PeerMgr, error) {
 	pm := &PeerMgr{
 		h:             h,
 		dht:           dht,
@@ -63,7 +74,23 @@ func NewPeerMgr(h host.Host, dht *dht.IpfsDHT, bootstrap dtypes.BootstrapPeers) 
 
 		maxFilPeers: MaxFilPeers,
 		minFilPeers: MinFilPeers,
+
+		done: make(chan struct{}),
 	}
+	emitter, err := h.EventBus().Emitter(new(NewFilPeer))
+	if err != nil {
+		return nil, xerrors.Errorf("creating NewFilPeer emitter: %w", err)
+	}
+	pm.filPeerEmitter = emitter
+
+	lc.Append(fx.Hook{
+		OnStop: func(ctx context.Context) error {
+			return multierr.Combine(
+				pm.filPeerEmitter.Close(),
+				pm.Stop(ctx),
+			)
+		},
+	})
 
 	pm.notifee = &net.NotifyBundle{
 		DisconnectedF: func(_ net.Network, c net.Conn) {
@@ -73,10 +100,11 @@ func NewPeerMgr(h host.Host, dht *dht.IpfsDHT, bootstrap dtypes.BootstrapPeers) 
 
 	h.Network().Notify(pm.notifee)
 
-	return pm
+	return pm, nil
 }
 
 func (pmgr *PeerMgr) AddFilecoinPeer(p peer.ID) {
+	_ = pmgr.filPeerEmitter.Emit(NewFilPeer{Id: p}) //nolint:errcheck
 	pmgr.peersLk.Lock()
 	defer pmgr.peersLk.Unlock()
 	pmgr.peers[p] = time.Duration(0)
@@ -106,8 +134,14 @@ func (pmgr *PeerMgr) Disconnect(p peer.ID) {
 	}
 }
 
+func (pmgr *PeerMgr) Stop(ctx context.Context) error {
+	log.Warn("closing peermgr done")
+	close(pmgr.done)
+	return nil
+}
+
 func (pmgr *PeerMgr) Run(ctx context.Context) {
-	tick := time.NewTicker(time.Second * 5)
+	tick := build.Clock.Ticker(time.Second * 5)
 	for {
 		select {
 		case <-tick.C:
@@ -115,9 +149,12 @@ func (pmgr *PeerMgr) Run(ctx context.Context) {
 			if pcount < pmgr.minFilPeers {
 				pmgr.expandPeers()
 			} else if pcount > pmgr.maxFilPeers {
-				log.Debug("peer count about threshold: %d > %d", pcount, pmgr.maxFilPeers)
+				log.Debugf("peer count about threshold: %d > %d", pcount, pmgr.maxFilPeers)
 			}
 			stats.Record(ctx, metrics.PeerCount.M(int64(pmgr.getPeerCount())))
+		case <-pmgr.done:
+			log.Warn("exiting peermgr run")
+			return
 		}
 	}
 }
